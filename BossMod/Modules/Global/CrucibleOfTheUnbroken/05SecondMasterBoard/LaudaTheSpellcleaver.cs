@@ -63,6 +63,7 @@ public enum AID : uint
     UnseenForce = 49484, // LaudaTheSpellcleaver->self, 3.0s cast, single-target
     UnseenForce1 = 49485, // LaudaTheSpellcleaver->self, no cast, single-target
     UnseenForce2 = 49486, // Helper->player, no cast, single-target
+    UnseenForceGaze = 49487, // Helper->player, no cast, single-target, rotation = boss facing; applies Petrification if player faces boss
     Shockwave = 49489, // Helper->player, no cast, single-target
     GreaterStrengthBoss = 49472, // LaudaTheSpellcleaver->self, 3.0s cast, single-target
     SearingAxeBoss = 49477, // LaudaTheSpellcleaver->self, 27.1+0.9s cast, single-target
@@ -553,51 +554,131 @@ sealed class MagicalCombustion : Components.SimpleAOEs
     }
 }
 
+// Unseen Force: boss teleports, 'gazes' at each player (AID 49487) and marks them with status 5341.
+// When the status expires, Shockwave knocks the player along their *current facing*:
+// - player was facing the boss at the gaze (face-to-face, also gets Petrification) -> knocked backwards (facing + 180)
+// - player was facing away -> knocked forwards (facing + 0)
+// Verified on 3 shockwaves in a replay. Knockback distance measured ~30 (29.6-30.4), WIP value was 40.
+// Status ExpireAt matched Shockwave time within ~0.05s, so it is used as activation.
 sealed class UnseenForce(BossModule module) : Components.GenericKnockback(module)
 {
-    private readonly List<(Actor player, Angle offset, DateTime expireAt)> knockbacks = [];
-    private const float knockbackDistance = 40f;
-
-    public override void OnStatusGain(Actor actor, ref ActorStatus status)
-    {
-        if (status.ID == (uint)SID.UnseenForce)
-        {
-            var opposed = Module.PrimaryActor.Rotation.ToDirection().Dot(actor.Rotation.ToDirection()) < 0f;
-            knockbacks.Add((actor, opposed ? 180f.Degrees() : default, status.ExpireAt));
-        }
-    }
+    private const float KnockbackDistance = 30f;
+    private const float SafetyMargin = 1f;
+    private readonly List<(Actor player, bool backward, DateTime activation)> knockbacks = [];
+    private readonly Dictionary<ulong, bool> gazeResult = [];
+    // middle band of the board where no direction keeps you inside after a 30y knockback; safe spots are both ends of the board
+    private static readonly AOEShapeRect middleBand = new(KnockbackDistance - 20f + SafetyMargin + 1f, 15f, KnockbackDistance - 20f + SafetyMargin + 1f);
 
     public override void OnEventCast(Actor caster, ActorCastEvent spell)
     {
-        if (spell.Action.ID == (uint)AID.Shockwave)
+        switch (spell.Action.ID)
         {
-            if (knockbacks.Count > 0)
+            case (uint)AID.UnseenForceGaze:
+                if (WorldState.Actors.Find(spell.MainTargetID) is Actor target)
+                {
+                    gazeResult[target.InstanceID] = IsFaceToFace(spell.Rotation, target.Rotation);
+                }
+                break;
+            case (uint)AID.Shockwave:
+                var count = knockbacks.Count;
+                var removed = false;
+                for (var i = 0; i < count; ++i)
+                {
+                    if (knockbacks[i].player.InstanceID == spell.MainTargetID)
+                    {
+                        knockbacks.RemoveAt(i);
+                        removed = true;
+                        break;
+                    }
+                }
+                if (!removed && count > 0)
+                {
+                    knockbacks.RemoveAt(0);
+                }
+                gazeResult.Remove(spell.MainTargetID);
+                break;
+        }
+    }
+
+    public override void OnStatusGain(Actor actor, ref ActorStatus status)
+    {
+        if (status.ID == (uint)SID.UnseenForce && !FindKnockback(actor).found) // OnStatusGain is also called on status change, avoid duplicates
+        {
+            // prefer the facing captured at the gaze event; fall back to comparing with current boss facing
+            if (!gazeResult.TryGetValue(actor.InstanceID, out var backward))
             {
-                knockbacks.RemoveAt(0);
+                backward = IsFaceToFace(Module.PrimaryActor.Rotation, actor.Rotation);
+            }
+            knockbacks.Add((actor, backward, status.ExpireAt));
+        }
+    }
+
+    public override void OnStatusLose(Actor actor, ref ActorStatus status)
+    {
+        // safety net in case the Shockwave event is missed (e.g. player died before it)
+        if (status.ID == (uint)SID.UnseenForce && actor.IsDead)
+        {
+            var count = knockbacks.Count;
+            for (var i = 0; i < count; ++i)
+            {
+                if (knockbacks[i].player == actor)
+                {
+                    knockbacks.RemoveAt(i);
+                    break;
+                }
             }
         }
+    }
+
+    private static bool IsFaceToFace(Angle bossFacing, Angle playerFacing) => bossFacing.ToDirection().Dot(playerFacing.ToDirection()) < 0f;
+
+    private (bool found, bool backward, DateTime activation) FindKnockback(Actor actor)
+    {
+        var count = knockbacks.Count;
+        for (var i = 0; i < count; ++i)
+        {
+            var kb = knockbacks[i];
+            if (kb.player == actor)
+            {
+                return (true, kb.backward, kb.activation);
+            }
+        }
+        return default;
     }
 
     public override ReadOnlySpan<Knockback> ActiveKnockbacks(int slot, Actor actor)
     {
-        var count = knockbacks.Count;
-        if (count == 0)
+        var (found, backward, activation) = FindKnockback(actor);
+        if (!found)
         {
             return [];
         }
+        return new Knockback[] { new(actor.Position, KnockbackDistance, activation, direction: actor.Rotation + (backward ? 180f.Degrees() : default), kind: Kind.DirForward) };
+    }
 
-        var incomingKnockbacks = CollectionsMarshal.AsSpan(knockbacks);
-        foreach (var (player, offset, expireAt) in incomingKnockbacks)
+    public override void AddHints(int slot, Actor actor, TextHints hints)
+    {
+        var (found, backward, _) = FindKnockback(actor);
+        if (!found)
         {
-            if (player != actor)
-            {
-                continue;
-            }
+            return;
+        }
+        hints.Add(backward ? "Knockback BACKWARD: go to an end of the board, put your back to the long side!" : "Knockback FORWARD: go to an end of the board, face the long side!", false);
+        base.AddHints(slot, actor, hints);
+    }
 
-            return new Knockback[] { new(player.Position, knockbackDistance, expireAt, direction: player.Rotation + offset, kind: Kind.DirForward) };
+    public override void AddAIHints(int slot, Actor actor, PartyRolesConfig.Assignment assignment, AIHints hints)
+    {
+        var (found, backward, activation) = FindKnockback(actor);
+        if (!found || IsImmune(slot, activation))
+        {
+            return;
         }
 
-        return [];
+        // 1) stand near one of the short ends of the board (only there a 30y knockback can land inside)
+        hints.AddForbiddenZone(middleBand, LaudaTheSpellcleaver.BoardCenter, default, activation);
+        // 2) rotate the character so that the knockback stays inside the board (handled by SmartRotation)
+        Arena.Bounds.Shape.AddForbiddenDirections(actor.Position - Arena.Center, backward ? 180f.Degrees() : default, hints, activation, KnockbackDistance, SafetyMargin);
     }
 }
 
@@ -642,33 +723,39 @@ sealed class SearingAxe(BossModule module) : Components.GenericAOEs(module)
     }
 }
 
-sealed class GuttlerGlutter(BossModule module) : Components.SimpleKnockbacks(module, (uint)AID.GuttlerGlutterBoss, 20f)
+// Guttler Glutter: two Indefatigable Blades become targetable and tether to the boss, boss starts a ~27s cast.
+// Meanwhile GuttlerGlutter/GuttlerGlutter1 raidwides tick (accelerating from ~1.1s to ~0.6s interval).
+// Replay: one blade killed, the other left at ~44% HP -> party died to the ticks before the cast even finished.
+// No knockback was observed in the replay (the previous WIP 20y knockback from the boss made almost the whole board 'unsafe').
+sealed class GuttlerGlutter(BossModule module) : Components.CastHint(module, (uint)AID.GuttlerGlutterBoss, "", true)
 {
-    public override ReadOnlySpan<Knockback> ActiveKnockbacks(int slot, Actor actor)
+    private readonly List<Actor> blades = module.Enemies((uint)OID.IndefatigableBlade);
+
+    public int AliveBlades
     {
-        var count = Casters.Count;
-        if (count == 0)
+        get
         {
-            return [];
+            var n = 0;
+            var count = blades.Count;
+            for (var i = 0; i < count; ++i)
+            {
+                var b = blades[i];
+                if (!b.IsDead && b.IsTargetable)
+                {
+                    ++n;
+                }
+            }
+            return n;
         }
-
-        var kbs = CollectionsMarshal.AsSpan(Casters);
-        if (kbs[0].Activation > WorldState.CurrentTime.AddSeconds(5d))
-        {
-            return [];
-        }
-
-        return kbs;
     }
 
-    public override void OnCastFinished(Actor caster, ActorCastInfo spell)
+    public override void AddGlobalHints(Actor actor, GlobalHints hints)
     {
-        if (spell.Action.ID == (uint)AID.GuttlerGlutterFinish)
+        var alive = AliveBlades;
+        if (alive > 0)
         {
-            if (Casters.Count > 0)
-            {
-                Casters.RemoveAt(0);
-            }
+            var timeLeft = Active ? $", {Casters[0].CastInfo?.NPCRemainingTime ?? 0f:f1}s left" : "";
+            hints.Add($"Kill BOTH Indefatigable Blades! ({alive} left{timeLeft})");
         }
     }
 }
@@ -727,6 +814,8 @@ sealed class LaudaTheSpellcleaverStates : StateMachineBuilder
 [ModuleInfo(BossModuleInfo.Maturity.WIP, PrimaryActorOID = (uint)OID.LaudaTheSpellcleaver, Contributors = "Equilius", GroupType = BossModuleInfo.GroupType.CrucibleOfTheUnbroken, GroupID = 1092u, NameID = 14693u, SortOrder = 14)]
 public sealed class LaudaTheSpellcleaver : BossModule
 {
+    public static readonly WPos BoardCenter = new(520f, -420f);
+
     protected override void CalculateModuleAIHints(int slot, Actor actor, PartyRolesConfig.Assignment assignment, AIHints hints)
     {
         var count = hints.PotentialTargets.Count;
