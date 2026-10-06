@@ -558,16 +558,20 @@ sealed class MagicalCombustion : Components.SimpleAOEs
 // When the status expires, Shockwave knocks the player along their *current facing*:
 // - player was facing the boss at the gaze (face-to-face, also gets Petrification) -> knocked backwards (facing + 180)
 // - player was facing away -> knocked forwards (facing + 0)
-// Verified on 3 shockwaves in a replay. Knockback distance measured ~30 (29.6-30.4), WIP value was 40.
+// Verified on 5 shockwaves over 2 replays. Knockback distance is 40 (two full, unclipped trajectories: 40.05 and 39.96).
+// Board is only 40 long, so the only safe spots are the small 5x5 squares sticking out at both short ends:
+// stand there and get knocked straight along the long axis.
 // Status ExpireAt matched Shockwave time within ~0.05s, so it is used as activation.
 sealed class UnseenForce(BossModule module) : Components.GenericKnockback(module)
 {
-    private const float KnockbackDistance = 30f;
+    private const float KnockbackDistance = 40f;
     private const float SafetyMargin = 1f;
     private readonly List<(Actor player, bool backward, DateTime activation)> knockbacks = [];
     private readonly Dictionary<ulong, bool> gazeResult = [];
-    // middle band of the board where no direction keeps you inside after a 30y knockback; safe spots are both ends of the board
-    private static readonly AOEShapeRect middleBand = new(KnockbackDistance - 20f + SafetyMargin + 1f, 15f, KnockbackDistance - 20f + SafetyMargin + 1f);
+    // safe start spots: inside the end squares (x 517.5-522.5, z -445..-440 and -400..-395), at least ~1.5y into the square
+    // start z -444.5..-441.5 -> lands z -404.5..-401.5 (and mirrored for the other end)
+    private static readonly WPos safeSouth = new(520f, -443f), safeNorth = new(520f, -397f);
+    private static readonly AOEShapeRect safeSpot = new(1.5f, 2f, 1.5f, invertForbiddenZone: true);
 
     public override void OnEventCast(Actor caster, ActorCastEvent spell)
     {
@@ -663,7 +667,7 @@ sealed class UnseenForce(BossModule module) : Components.GenericKnockback(module
         {
             return;
         }
-        hints.Add(backward ? "Knockback BACKWARD: go to an end of the board, put your back to the long side!" : "Knockback FORWARD: go to an end of the board, face the long side!", false);
+        hints.Add(backward ? "Knockback BACKWARD: stand in a small square at the end of the board, put your back to the board!" : "Knockback FORWARD: stand in a small square at the end of the board, face the board!", false);
         base.AddHints(slot, actor, hints);
     }
 
@@ -675,8 +679,9 @@ sealed class UnseenForce(BossModule module) : Components.GenericKnockback(module
             return;
         }
 
-        // 1) stand near one of the short ends of the board (only there a 30y knockback can land inside)
-        hints.AddForbiddenZone(middleBand, LaudaTheSpellcleaver.BoardCenter, default, activation);
+        // 1) go to the nearer end square (only there a 40y knockback can land inside)
+        var safe = actor.Position.Z < LaudaTheSpellcleaver.BoardCenter.Z ? safeSouth : safeNorth;
+        hints.AddForbiddenZone(safeSpot, safe, default, activation);
         // 2) rotate the character so that the knockback stays inside the board (handled by SmartRotation)
         Arena.Bounds.Shape.AddForbiddenDirections(actor.Position - Arena.Center, backward ? 180f.Degrees() : default, hints, activation, KnockbackDistance, SafetyMargin);
     }
@@ -729,25 +734,26 @@ sealed class SearingAxe(BossModule module) : Components.GenericAOEs(module)
 // No knockback was observed in the replay (the previous WIP 20y knockback from the boss made almost the whole board 'unsafe').
 sealed class GuttlerGlutter(BossModule module) : Components.CastHint(module, (uint)AID.GuttlerGlutterBoss, "", true)
 {
-    private readonly List<Actor> blades = module.Enemies((uint)OID.IndefatigableBlade);
+    // single-OID lists are live (kept updated by the module); the uint[] overload would only be a snapshot
+    private readonly List<Actor> indefatigable = module.Enemies((uint)OID.IndefatigableBlade);
+    private readonly List<Actor> magicked = module.Enemies((uint)OID.MagickedBlade);
 
-    public int AliveBlades
+    private static int CountAlive(List<Actor> list)
     {
-        get
+        var n = 0;
+        var count = list.Count;
+        for (var i = 0; i < count; ++i)
         {
-            var n = 0;
-            var count = blades.Count;
-            for (var i = 0; i < count; ++i)
+            var b = list[i];
+            if (!b.IsDead && b.IsTargetable)
             {
-                var b = blades[i];
-                if (!b.IsDead && b.IsTargetable)
-                {
-                    ++n;
-                }
+                ++n;
             }
-            return n;
         }
+        return n;
     }
+
+    public int AliveBlades => CountAlive(indefatigable) + CountAlive(magicked);
 
     public override void AddGlobalHints(Actor actor, GlobalHints hints)
     {
@@ -755,7 +761,7 @@ sealed class GuttlerGlutter(BossModule module) : Components.CastHint(module, (ui
         if (alive > 0)
         {
             var timeLeft = Active ? $", {Casters[0].CastInfo?.NPCRemainingTime ?? 0f:f1}s left" : "";
-            hints.Add($"Kill BOTH Indefatigable Blades! ({alive} left{timeLeft})");
+            hints.Add($"Kill BOTH blades! ({alive} left{timeLeft})");
         }
     }
 }
@@ -831,7 +837,33 @@ public sealed class LaudaTheSpellcleaver : BossModule
                 _ => 0
             };
         }
+
+        // blade check (Guttler Glutter / Searing Axe): both tethered blades must die before the long boss cast ends.
+        // In a replay, RSR kept hitting the boss until the player clicked a blade manually, so the target is forced here
+        // (works like clicking the blade every frame; any rotation plugin then attacks it).
+        Actor? bestBlade = null;
+        var blades = Enemies(bladeOIDs);
+        var bladeCount = blades.Count;
+        for (var i = 0; i < bladeCount; ++i)
+        {
+            var b = blades[i];
+            if (b.IsDead || !b.IsTargetable)
+            {
+                continue;
+            }
+            // finish the lower HP blade first, ties -> closer one
+            if (bestBlade == null || b.HPMP.CurHP < bestBlade.HPMP.CurHP || (b.HPMP.CurHP == bestBlade.HPMP.CurHP && (b.Position - actor.Position).LengthSq() < (bestBlade.Position - actor.Position).LengthSq()))
+            {
+                bestBlade = b;
+            }
+        }
+        if (bestBlade != null)
+        {
+            hints.ForcedTarget = bestBlade;
+        }
     }
+
+    private static readonly uint[] bladeOIDs = [(uint)OID.IndefatigableBlade, (uint)OID.MagickedBlade];
 
     protected override void DrawEnemies(int pcSlot, Actor pc)
     {
