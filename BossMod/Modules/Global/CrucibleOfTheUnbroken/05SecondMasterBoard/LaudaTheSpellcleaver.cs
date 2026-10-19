@@ -109,8 +109,30 @@ public enum TetherID : uint
     IndefatigableBladeTether = 5, // 4D22->LaudaTheSpellcleaver
 }
 
-sealed class GluttonousGutting(BossModule module) : Components.SimpleAOEs(module, (uint)AID.GluttonousGutting, new AOEShapeRect(50f, 20f));
-sealed class GluttonousGoring(BossModule module) : Components.SimpleAOEs(module, (uint)AID.GluttonousGoring, 40f);
+// Gutting is cast from one short end of the board towards the other, so the only safe spot is the small square behind its origin.
+// It resolves ~3s after the 2nd Unseen Force shockwave: while that knockback is still pending, its AI hint is suppressed,
+// otherwise the AI gets two contradicting goals (UnseenForce picks the starting square with this AOE in mind).
+sealed class GluttonousGutting(BossModule module) : Components.SimpleAOEs(module, (uint)AID.GluttonousGutting, new AOEShapeRect(50f, 20f))
+{
+    public override void AddAIHints(int slot, Actor actor, PartyRolesConfig.Assignment assignment, AIHints hints)
+    {
+        if (!UnseenForce.KnockbackPendingBefore(Module, actor, Casters))
+        {
+            base.AddAIHints(slot, actor, assignment, hints);
+        }
+    }
+}
+
+sealed class GluttonousGoring(BossModule module) : Components.SimpleAOEs(module, (uint)AID.GluttonousGoring, 40f)
+{
+    public override void AddAIHints(int slot, Actor actor, PartyRolesConfig.Assignment assignment, AIHints hints)
+    {
+        if (!UnseenForce.KnockbackPendingBefore(Module, actor, Casters))
+        {
+            base.AddAIHints(slot, actor, assignment, hints);
+        }
+    }
+}
 
 sealed class AutoAttack(BossModule module) : Components.Cleave(module, (uint)AID.AutoAttack, new AOEShapeCone(9f, 55f.Degrees()))
 {
@@ -130,6 +152,15 @@ sealed class AutoAttack(BossModule module) : Components.Cleave(module, (uint)AID
     public override void AddAIHints(int slot, Actor actor, PartyRolesConfig.Assignment assignment, AIHints hints)
     {
         if (beastlyAura == null || beastlyAura.knockbacks.Count > 0)
+        {
+            return;
+        }
+
+        // the boss does not autoattack while casting or untargetable (replay: no autoattacks during the whole ~40s blade phase),
+        // but the cone towards its target (usually the player's own pet, which follows the player) was still forbidden,
+        // so the player kept sidestepping next to the boss instead of walking to the 2nd blade
+        var boss = Module.PrimaryActor;
+        if (boss.CastInfo != null || !boss.IsTargetable)
         {
             return;
         }
@@ -636,6 +667,46 @@ sealed class UnseenForce(BossModule module) : Components.GenericKnockback(module
 
     private static bool IsFaceToFace(Angle bossFacing, Angle playerFacing) => bossFacing.ToDirection().Dot(playerFacing.ToDirection()) < 0f;
 
+    // true if actor still has to take the Unseen Force knockback before the first of these AOEs resolves
+    public static bool KnockbackPendingBefore(BossModule module, Actor actor, List<Components.GenericAOEs.AOEInstance> aoes)
+    {
+        if (aoes.Count == 0 || module.FindComponent<UnseenForce>() is not UnseenForce comp)
+        {
+            return false;
+        }
+        var (found, _, activation) = comp.FindKnockback(actor);
+        return found && activation <= aoes[0].Activation;
+    }
+
+    // middle band of the board: from here both end squares are ~23y (~4s) away
+    private static readonly AOEShapeRect holdBand = new(4f, 10f, 4f, invertForbiddenZone: true);
+    private const double DecideSecondsBefore = 7.5d;
+
+    // choose which end square to start the knockback from; null = not decided yet, wait in the middle
+    private WPos? PickSafeSquare(Actor actor, DateTime kbActivation)
+    {
+        // Gluttonous Gutting (rect from one end): be knocked TOWARDS its origin, then step into the square behind it -> start at the far square
+        if (Module.FindComponent<GluttonousGutting>() is GluttonousGutting gutting && gutting.Casters.Count != 0 && gutting.Casters[0].Activation >= kbActivation)
+        {
+            var o = gutting.Casters[0].Origin;
+            return (o - safeSouth).LengthSq() > (o - safeNorth).LengthSq() ? safeSouth : safeNorth;
+        }
+        // Gluttonous Goring (big circle): be knocked AWAY from its origin -> start at the near square (never seen in a replay, best guess)
+        if (Module.FindComponent<GluttonousGoring>() is GluttonousGoring goring && goring.Casters.Count != 0 && goring.Casters[0].Activation >= kbActivation)
+        {
+            var o = goring.Casters[0].Origin;
+            return (o - safeSouth).LengthSq() < (o - safeNorth).LengthSq() ? safeSouth : safeNorth;
+        }
+        // the Gluttonous AOE (2nd knockback of each cycle) is only cast ~9.7s before the shockwave and its end is random;
+        // in a replay the player had already walked to the wrong square and the way back was blocked by Combusting Blades
+        // -> wait in the middle until shortly before the knockback, then take the nearer square
+        if (kbActivation > WorldState.FutureTime(DecideSecondsBefore))
+        {
+            return null;
+        }
+        return actor.Position.Z < LaudaTheSpellcleaver.BoardCenter.Z ? safeSouth : safeNorth;
+    }
+
     private (bool found, bool backward, DateTime activation) FindKnockback(Actor actor)
     {
         var count = knockbacks.Count;
@@ -679,9 +750,15 @@ sealed class UnseenForce(BossModule module) : Components.GenericKnockback(module
             return;
         }
 
-        // 1) go to the nearer end square (only there a 40y knockback can land inside)
-        var safe = actor.Position.Z < LaudaTheSpellcleaver.BoardCenter.Z ? safeSouth : safeNorth;
-        hints.AddForbiddenZone(safeSpot, safe, default, activation);
+        // 1) go to an end square (only there a 40y knockback can land inside), or wait in the middle while undecided
+        if (PickSafeSquare(actor, activation) is WPos safe)
+        {
+            hints.AddForbiddenZone(safeSpot, safe, default, activation);
+        }
+        else
+        {
+            hints.AddForbiddenZone(holdBand, LaudaTheSpellcleaver.BoardCenter, default, activation.AddSeconds(-DecideSecondsBefore));
+        }
         // 2) rotate the character so that the knockback stays inside the board (handled by SmartRotation)
         Arena.Bounds.Shape.AddForbiddenDirections(actor.Position - Arena.Center, backward ? 180f.Degrees() : default, hints, activation, KnockbackDistance, SafetyMargin);
     }
@@ -766,6 +843,88 @@ sealed class GuttlerGlutter(BossModule module) : Components.CastHint(module, (ui
     }
 }
 
+// Guttler Glutter finish: 20y knockback away from the boss (board center), ~1s after the boss cast ends.
+// Replay: player at 6.4y from center was knocked exactly 20.0y and landed off the board (Burns).
+// Only spots very close to the boss (within ~4y, roughly on the north-south line or diagonals) land inside the board.
+sealed class GuttlerGlutterKnockback(BossModule module) : Components.GenericKnockback(module)
+{
+    private const float KnockbackDistance = 20f;
+    private DateTime activation;
+    private WPos origin;
+    private RelSimplifiedComplexPolygon? poly;
+
+    public override void OnCastStarted(Actor caster, ActorCastInfo spell)
+    {
+        switch (spell.Action.ID)
+        {
+            case (uint)AID.GuttlerGlutterBoss:
+                origin = caster.Position;
+                activation = Module.CastFinishAt(spell, 1d);
+                break;
+            case (uint)AID.GuttlerGlutterFinish:
+                origin = spell.LocXZ;
+                activation = Module.CastFinishAt(spell);
+                break;
+        }
+    }
+
+    public override void OnEventCast(Actor caster, ActorCastEvent spell)
+    {
+        if (spell.Action.ID == (uint)AID.GuttlerGlutterFinish)
+        {
+            activation = default;
+        }
+    }
+
+    public override ReadOnlySpan<Knockback> ActiveKnockbacks(int slot, Actor actor)
+    {
+        if (activation == default)
+        {
+            return [];
+        }
+        return new Knockback[] { new(origin, KnockbackDistance, activation) };
+    }
+
+    private bool BladesAlive()
+    {
+        var blades = Module.Enemies((uint)OID.IndefatigableBlade);
+        var count = blades.Count;
+        for (var i = 0; i < count; ++i)
+        {
+            var b = blades[i];
+            if (!b.IsDead && b.IsTargetable)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public override void AddHints(int slot, Actor actor, TextHints hints)
+    {
+        if (activation != default && !BladesAlive())
+        {
+            hints.Add("Knockback from boss: hug the boss (north/south side)!", false);
+            base.AddHints(slot, actor, hints);
+        }
+    }
+
+    public override void AddAIHints(int slot, Actor actor, PartyRolesConfig.Assignment assignment, AIHints hints)
+    {
+        if (activation == default || IsImmune(slot, activation))
+        {
+            return;
+        }
+        // while blades are alive, keep attacking them; position only in the last few seconds or once both blades are dead
+        if (BladesAlive() && activation > WorldState.FutureTime(5d))
+        {
+            return;
+        }
+        poly ??= Arena.Bounds.Shape.Offset(-0.5f); // 0.5y margin from the board edge
+        hints.AddForbiddenZone(new SDKnockbackInComplexPolygonAwayFromOrigin(Arena.Center, origin, KnockbackDistance, poly), activation);
+    }
+}
+
 sealed class Gyrocleave(BossModule module) : Components.SimpleAOEs(module, (uint)AID.Gyrocleave, new AOEShapeRect(80f, 10f))
 {
     private readonly OverpoweringPointFake? overpoweringPointFake = module.FindComponent<OverpoweringPointFake>();
@@ -813,6 +972,7 @@ sealed class LaudaTheSpellcleaverStates : StateMachineBuilder
             .ActivateOnEnter<UnseenForce>()
             .ActivateOnEnter<SearingAxe>()
             .ActivateOnEnter<GuttlerGlutter>()
+            .ActivateOnEnter<GuttlerGlutterKnockback>()
             .ActivateOnEnter<AutoAttack>();
     }
 }
